@@ -4,297 +4,378 @@ from typing import List, Dict, Any, Optional
 from bson import ObjectId
 import logging
 
-from ..models import Store, CampaignStats, FlowStats
+from ..models import Store, CampaignStats
 from ..core.config import settings
-from .klaviyo_api import create_klaviyo_client
+from .klaviyo_api import klaviyo_get_all, klaviyo_report_post
+from .stats_merger import merge_campaign_stats_with_meta, merge_flow_stats_with_meta
+from .flow_definitions import get_flow_definitions, build_message_details_map
+from ..utils.memory_monitor import MemoryMonitor
 
 logger = logging.getLogger(__name__)
 
 
+async def klaviyo_update_stats(store: Store, date: Optional[datetime] = None) -> Store:
+    """Update store statistics from Klaviyo API - matching Node.js version"""
+    
+    # Log memory at sync start
+    MemoryMonitor.log_memory_usage(f"Sync Start - Store {store.public_id}")
+    
+    # Freshness threshold (temporarily reduced to force sync for debugging)
+    FRESHNESS_THRESHOLD_MS = 1 * 60 * 1000  # 1 minute instead of 15 minutes
+    now = datetime.utcnow()
+    last_sync = store.klaviyo_integration.campaign_values_last_update.timestamp() * 1000 if store.klaviyo_integration.campaign_values_last_update else 0
+    now_ms = now.timestamp() * 1000
+    
+    # If already updating, or data is fresh, do nothing
+    if store.klaviyo_integration.is_updating_dashboard or (now_ms - last_sync < FRESHNESS_THRESHOLD_MS):
+        logger.info('🔄 Sync skipped - data is fresh or already updating')
+        return store
+    
+    from_date = date.isoformat() if date else (store.klaviyo_integration.campaign_values_last_update.isoformat() if store.klaviyo_integration.campaign_values_last_update else datetime(2024, 1, 1).isoformat())
+    
+    # Set updating flag
+    store.klaviyo_integration.is_updating_dashboard = True
+    await store.save()
+    
+    try:
+        # Get API key (support both field names)
+        api_key = store.klaviyo_integration.apiKey or store.klaviyo_integration.api_key
+        if not api_key:
+            raise ValueError("No Klaviyo API key available")
+        
+        # Parallel API calls matching Node.js version
+        results = await asyncio.gather(
+            klaviyo_get_all(f"campaigns?filter=equals(messages.channel,'email'),greater-or-equal(created_at,{from_date}),equals(status,'Sent')&include=campaign-messages,tags", api_key),
+            klaviyo_get_all(f"campaigns?filter=equals(messages.channel,'sms'),greater-or-equal(created_at,{from_date}),equals(status,'Sent')&include=tags", api_key),
+            klaviyo_get_all("tags", api_key),
+            klaviyo_get_all("flows", api_key),
+            klaviyo_get_all("segments", api_key),
+            klaviyo_get_all("lists", api_key),
+            klaviyo_report_post("campaign-values-reports", {
+                "data": {
+                    "type": "campaign-values-report",
+                    "attributes": {
+                        "statistics": [
+                            "average_order_value",
+                            "bounce_rate",
+                            "bounced",
+                            "bounced_or_failed",
+                            "bounced_or_failed_rate",
+                            "click_rate",
+                            "click_to_open_rate",
+                            "clicks",
+                            "clicks_unique",
+                            "conversion_rate",
+                            "conversion_uniques",
+                            "conversion_value",
+                            "conversions",
+                            "delivered",
+                            "delivery_rate",
+                            "failed",
+                            "failed_rate",
+                            "open_rate",
+                            "opens",
+                            "opens_unique",
+                            "recipients",
+                            "revenue_per_recipient",
+                            "spam_complaint_rate",
+                            "spam_complaints",
+                            "unsubscribe_rate",
+                            "unsubscribe_uniques",
+                            "unsubscribes"
+                        ],
+                        "timeframe": {
+                            "key": "last_12_months"
+                        },
+                        "conversion_metric_id": store.klaviyo_integration.conversion_metric_id,
+                        "filter": "contains-any(send_channel,['email','sms'])"
+
+                    }
+                }
+            }, api_key),
+            klaviyo_report_post("flow-series-reports", {
+                "data": {
+                    "type": "flow-series-report",
+                    "attributes": {
+                        "statistics": [
+                            "average_order_value",
+                            "bounce_rate",
+                            "bounced",
+                            "bounced_or_failed",
+                            "bounced_or_failed_rate",
+                            "click_rate",
+                            "click_to_open_rate",
+                            "clicks",
+                            "clicks_unique",
+                            "conversion_rate",
+                            "conversion_uniques",
+                            "conversion_value",
+                            "conversions",
+                            "delivered",
+                            "delivery_rate",
+                            "failed",
+                            "failed_rate",
+                            "open_rate",
+                            "opens",
+                            "opens_unique",
+                            "recipients",
+                            "revenue_per_recipient",
+                            "spam_complaint_rate",
+                            "spam_complaints",
+                            "unsubscribe_rate",
+                            "unsubscribe_uniques",
+                            "unsubscribes"
+                        ],
+                        "timeframe": {
+                            "start": (datetime.utcnow() - timedelta(days=60)).isoformat(),
+                            "end": datetime.utcnow().isoformat()
+                        },
+                        "interval": "daily",
+                        "conversion_metric_id": store.klaviyo_integration.conversion_metric_id
+                    }
+                }
+            }, api_key)
+        )
+        
+        # Unpack results
+        campaigns, sms_campaigns, tags, flows, segments, lists, campaign_values_reports, flow_series_reports = results
+        
+        # Merge campaign stats with metadata
+        merged = merge_campaign_stats_with_meta(
+            campaign_values_reports["data"]["attributes"]["results"],
+            campaigns["data"],
+            sms_campaigns["data"],
+            segments["data"],
+            lists["data"],
+            tags["data"]
+        )
+        
+        # Get unique flow IDs from the results to fetch their definitions
+        unique_flow_ids = list(set(
+            result["groupings"]["flow_id"] 
+            for result in flow_series_reports["data"]["attributes"]["results"]
+        ))
+        
+        logger.info(f"🔍 Fetching definitions for {len(unique_flow_ids)} flows")
+        
+        # Fetch flow definitions with message details (uses additional-fields parameter)
+        flow_definitions = await get_flow_definitions(unique_flow_ids, api_key)
+        
+        # Build message details map from flow definitions
+        message_details_map = build_message_details_map(flow_definitions)
+        
+        logger.info(f"📋 Found message details for {len(message_details_map)} flow messages")
+        
+        # Merge flow stats with metadata
+        merged_flows = merge_flow_stats_with_meta(
+            flow_series_reports["data"]["attributes"]["results"],
+            flows["data"],
+            tags["data"],
+            message_details_map
+        )
+        
+        # Extract tag names
+        tag_names = [tag["attributes"]["name"] for tag in tags["data"] if tag.get("attributes", {}).get("name")]
+        
+        # Convert date_times strings to Date objects for storage
+        flow_date_times = [
+            datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            for date_str in flow_series_reports["data"]["attributes"].get("date_times", [])
+        ]
+        
+        # Update store with Klaviyo integration
+        now = datetime.utcnow()
+        store.klaviyo_integration.campaign_values_last_update = now
+        store.klaviyo_integration.flow_values_last_update = now
+        store.tagNames = tag_names
+        store.klaviyo_integration.is_updating_dashboard = False
+        store.klaviyo_integration.flow_date_times = flow_date_times
+        await store.save()
+        
+        # Upsert campaign and flow stats
+        await upsert_campaign_stats(merged, store.klaviyo_integration.public_id)
+        await upsert_flow_stats(merged_flows, store.klaviyo_integration.public_id)
+        
+        # Log memory after sync completion
+        MemoryMonitor.log_memory_usage(f"Sync Complete - Store {store.public_id}")
+        
+        return store
+        
+    except Exception as e:
+        # On error, clear updating flag
+        store.klaviyo_integration.is_updating_dashboard = False
+        await store.save()
+        logger.error(f"Error during sync for store {store.public_id}: {str(e)}")
+        
+        # Log memory on error
+        MemoryMonitor.log_memory_usage(f"Sync Error - Store {store.public_id}")
+        raise
+
+
+async def upsert_campaign_stats(merged: List[Dict[str, Any]], klaviyo_public_id: str):
+    """Upsert campaign statistics - matching Node.js version"""
+    for stat in merged:
+        # Find existing stat
+        existing = await CampaignStats.find_one({
+            "klaviyo_public_id": klaviyo_public_id,
+            "groupings.campaign_id": stat["groupings"]["campaign_id"]
+        })
+        
+        if existing:
+            # Update existing
+            for key, value in stat.items():
+                setattr(existing, key, value)
+            existing.klaviyo_public_id = klaviyo_public_id
+            await existing.save()
+        else:
+            # Create new
+            new_stat = CampaignStats(
+                **stat,
+                klaviyo_public_id=klaviyo_public_id
+            )
+            await new_stat.save()
+    
+    logger.info(f"✅ Completed upserting campaign stats for klaviyo account {klaviyo_public_id}")
+
+
+async def upsert_flow_stats(merged: List[Dict[str, Any]], klaviyo_public_id: str):
+    """Upsert flow statistics to FlowRecentStats for daily data"""
+    logger.info(f"🔄 Upserting {len(merged)} flow stats for klaviyo account {klaviyo_public_id}")
+    
+    # Import FlowRecentStats model
+    try:
+        from ..models import FlowRecentStats
+        
+        # Process the flow stats for FlowRecentStats
+        flow_stats_to_upsert = []
+        
+        for stat in merged:
+            # Extract from groupings like the merger creates them
+            groupings = stat.get("groupings", {})
+            flow_id = groupings.get("flow_id")
+            flow_message_id = groupings.get("flow_message_id")
+            send_channel = groupings.get("send_channel")
+            
+            logger.info(f"📊 Flow: {flow_id} - Message: {flow_message_id} ({send_channel})")
+            
+            # Prepare document for FlowRecentStats with arrays of statistics
+            doc = {
+                "klaviyo_public_id": klaviyo_public_id,
+                "flow_id": flow_id,
+                "flow_message_id": flow_message_id,
+                "send_channel": send_channel,
+                "flow_name": stat.get("flow_name"),
+                "flow_message_name": stat.get("flow_message_name"),
+                "flow_message_subject": stat.get("flow_message_content"),
+                "tag_ids": stat.get("tag_ids", []),
+                "tag_names": stat.get("tag_names", []),
+                "statistics": stat.get("statistics", {}),
+                "date_times": stat.get("date_times", []),
+                "last_updated": datetime.utcnow()
+            }
+            
+            flow_stats_to_upsert.append(doc)
+        
+        # Use bulk upsert method if available
+        if hasattr(FlowRecentStats, 'bulk_upsert_flow_stats'):
+            result = await FlowRecentStats.bulk_upsert_flow_stats(flow_stats_to_upsert)
+            logger.info(f"✅ Bulk upserted flow stats: {result}")
+        else:
+            # Fallback to individual upserts
+            for doc in flow_stats_to_upsert:
+                existing = await FlowRecentStats.find_one({
+                    "klaviyo_public_id": doc["klaviyo_public_id"],
+                    "flow_id": doc["flow_id"],
+                    "flow_message_id": doc["flow_message_id"],
+                    "send_channel": doc["send_channel"]
+                })
+                
+                if existing:
+                    # Update existing
+                    for key, value in doc.items():
+                        setattr(existing, key, value)
+                    await existing.save()
+                else:
+                    # Create new
+                    new_stat = FlowRecentStats(**doc)
+                    await new_stat.save()
+        
+        logger.info(f"✅ Completed upserting flow stats for klaviyo account {klaviyo_public_id}")
+        
+    except ImportError:
+        # Fallback to direct MongoDB operations if FlowRecentStats is not available
+        logger.warning("FlowRecentStats model not available, using direct MongoDB operations")
+        from ..db.database import get_database
+        db = await get_database()
+        collection = db.flowrecentstats
+        
+        for stat in merged:
+            # Extract from groupings like the merger creates them
+            groupings = stat.get("groupings", {})
+            flow_id = groupings.get("flow_id")
+            flow_message_id = groupings.get("flow_message_id")
+            send_channel = groupings.get("send_channel")
+            
+            logger.info(f"📊 Flow: {flow_id} - Message: {flow_message_id} ({send_channel})")
+            
+            # Prepare document with klaviyo reference
+            doc = {
+                **stat,
+                "klaviyo_public_id": klaviyo_public_id,
+                "last_updated": datetime.utcnow(),
+                "updatedAt": datetime.utcnow()
+            }
+            
+            # Upsert using MongoDB directly
+            await collection.update_one(
+                {
+                    "klaviyo_public_id": klaviyo_public_id,
+                    "flow_id": flow_id,
+                    "flow_message_id": flow_message_id,
+                    "send_channel": send_channel
+                },
+                {"$set": doc},
+                upsert=True
+            )
+        
+        logger.info(f"✅ Completed upserting flow stats for klaviyo account {klaviyo_public_id}")
+
+
+# Legacy functions for compatibility
 async def is_data_fresh(store: Store) -> bool:
     """Check if dashboard data is fresh enough"""
-    if not store.last_dashboard_sync:
+    if not store.klaviyo_integration.campaign_values_last_update:
         return False
     
     threshold = timedelta(minutes=settings.SYNC_FRESHNESS_THRESHOLD_MINUTES)
-    return datetime.utcnow() - store.last_dashboard_sync < threshold
+    return datetime.utcnow() - store.klaviyo_integration.campaign_values_last_update < threshold
 
 
-async def sync_campaign_stats(store: Store, client) -> Dict[str, int]:
-    """Sync campaign statistics for a store"""
-    try:
-        logger.info(f"Starting campaign sync for store {store.public_id}")
-        
-        # Get campaigns
-        campaigns = await client.get_campaigns()
-        
-        # Get tags for mapping
-        tags = await client.get_tags()
-        tag_map = {tag["id"]: tag["attributes"]["name"] for tag in tags}
-        
-        # Get lists and segments for audience info
-        lists = await client.get_lists()
-        segments = await client.get_segments()
-        
-        audience_map = {}
-        for lst in lists:
-            audience_map[lst["id"]] = {
-                "name": lst["attributes"]["name"],
-                "type": "list"
-            }
-        for segment in segments:
-            audience_map[segment["id"]] = {
-                "name": segment["attributes"]["name"],
-                "type": "segment"
-            }
-        
-        created_count = 0
-        updated_count = 0
-        
-        for campaign in campaigns:
-            campaign_id = campaign["id"]
-            attributes = campaign["attributes"]
-            
-            # Get campaign metrics
-            metrics = await client.get_campaign_metrics(
-                campaign_id,
-                [
-                    "opens", "open_rate", "clicks", "click_rate",
-                    "delivered", "bounced", "unsubscribes", "spam_complaints",
-                    "conversions", "conversion_value"
-                ]
-            )
-            
-            # Prepare campaign stat data
-            stat_data = {
-                "groupings": {
-                    "send_channel": attributes.get("send_channel", "email"),
-                    "campaign_id": campaign_id,
-                    "campaign_message_id": attributes.get("message_id", campaign_id)
-                },
-                "campaign_name": attributes.get("name"),
-                "store_id": store.id,
-                "store_public_id": store.public_id,
-                "send_time": datetime.fromisoformat(attributes["send_time"].replace("Z", "+00:00")) if attributes.get("send_time") else None,
-                "created_at": datetime.fromisoformat(attributes["created_at"].replace("Z", "+00:00")) if attributes.get("created_at") else None,
-                "scheduled_at": datetime.fromisoformat(attributes["scheduled_at"].replace("Z", "+00:00")) if attributes.get("scheduled_at") else None,
-                "updated_at": datetime.fromisoformat(attributes["updated_at"].replace("Z", "+00:00")) if attributes.get("updated_at") else None
-            }
-            
-            # Add statistics
-            if metrics:
-                stat_data["statistics"] = metrics.get("attributes", {})
-            
-            # Add tag information
-            campaign_tags = campaign.get("relationships", {}).get("tags", {}).get("data", [])
-            tag_ids = [tag["id"] for tag in campaign_tags]
-            tag_names = [tag_map.get(tag_id, "") for tag_id in tag_ids if tag_id in tag_map]
-            
-            stat_data["tag_ids"] = tag_ids
-            stat_data["tag_names"] = tag_names
-            
-            # Add audience information
-            audiences = campaign.get("relationships", {}).get("audiences", {}).get("data", [])
-            included_audiences = []
-            excluded_audiences = []
-            
-            for audience in audiences:
-                audience_id = audience["id"]
-                if audience_id in audience_map:
-                    audience_info = {
-                        "id": audience_id,
-                        "name": audience_map[audience_id]["name"],
-                        "type": audience_map[audience_id]["type"]
-                    }
-                    
-                    if audience.get("included", True):
-                        included_audiences.append(audience_info)
-                    else:
-                        excluded_audiences.append(audience_info)
-            
-            stat_data["included_audiences"] = included_audiences
-            stat_data["excluded_audiences"] = excluded_audiences
-            
-            # Check if stat exists
-            existing = await CampaignStats.find_one({
-                "groupings.campaign_id": campaign_id,
-                "store_public_id": store.public_id
-            })
-            
-            if existing:
-                # Update existing
-                for key, value in stat_data.items():
-                    setattr(existing, key, value)
-                await existing.save()
-                updated_count += 1
-            else:
-                # Create new
-                new_stat = CampaignStats(**stat_data)
-                await new_stat.save()
-                created_count += 1
-        
-        logger.info(f"Campaign sync completed for store {store.public_id}: {created_count} created, {updated_count} updated")
-        return {"created": created_count, "updated": updated_count}
-        
-    except Exception as e:
-        logger.error(f"Error syncing campaigns for store {store.public_id}: {str(e)}")
-        raise
-
-
-async def sync_flow_stats(store: Store, client) -> Dict[str, int]:
-    """Sync flow statistics for a store"""
-    try:
-        logger.info(f"Starting flow sync for store {store.public_id}")
-        
-        # Get flows
-        flows = await client.get_flows()
-        
-        # Get tags for mapping
-        tags = await client.get_tags()
-        tag_map = {tag["id"]: tag["attributes"]["name"] for tag in tags}
-        
-        flow_stats_to_upsert = []
-        
-        for flow in flows:
-            flow_id = flow["id"]
-            flow_attributes = flow["attributes"]
-            
-            # Get flow messages
-            messages = await client.get_flow_messages(flow_id)
-            
-            for message in messages:
-                message_id = message["id"]
-                
-                # Get message metrics
-                metrics = await client.get_flow_message_metrics(flow_id, message_id)
-                
-                # Prepare flow stat data
-                stat_data = {
-                    "store": store.id,
-                    "store_public_id": store.public_id,
-                    "flow_id": flow_id,
-                    "flow_message_id": message_id,
-                    "flow_name": flow_attributes.get("name"),
-                    "flow_status": flow_attributes.get("status"),
-                    "flow_archived": flow_attributes.get("archived", False),
-                    "flow_created": datetime.fromisoformat(flow_attributes["created"].replace("Z", "+00:00")) if flow_attributes.get("created") else None,
-                    "flow_updated": datetime.fromisoformat(flow_attributes["updated"].replace("Z", "+00:00")) if flow_attributes.get("updated") else None,
-                    "flow_trigger_type": flow_attributes.get("trigger_type"),
-                    "send_channel": message.get("attributes", {}).get("channel", "email"),
-                    "last_updated": datetime.utcnow()
-                }
-                
-                # Add message details
-                message_attrs = message.get("attributes", {})
-                stat_data.update({
-                    "message_name": message_attrs.get("name"),
-                    "message_from_email": message_attrs.get("from_email"),
-                    "message_from_label": message_attrs.get("from_label"),
-                    "message_subject_line": message_attrs.get("subject"),
-                    "message_preview_text": message_attrs.get("preview_text"),
-                    "message_template_id": message_attrs.get("template_id")
-                })
-                
-                # Add statistics (as arrays for time series)
-                if metrics and "attributes" in metrics:
-                    metric_attrs = metrics["attributes"]
-                    stat_data["statistics"] = {
-                        "opens": metric_attrs.get("opens", []),
-                        "clicks": metric_attrs.get("clicks", []),
-                        "delivered": metric_attrs.get("delivered", []),
-                        "bounced": metric_attrs.get("bounced", []),
-                        "unsubscribes": metric_attrs.get("unsubscribes", []),
-                        "spam_complaints": metric_attrs.get("spam_complaints", []),
-                        "conversions": metric_attrs.get("conversions", []),
-                        "conversion_value": metric_attrs.get("conversion_value", [])
-                    }
-                    
-                    # Add date times from metrics
-                    stat_data["date_times"] = [
-                        datetime.fromisoformat(dt.replace("Z", "+00:00"))
-                        for dt in metric_attrs.get("datetime", [])
-                    ]
-                
-                # Add tag information
-                flow_tags = flow.get("relationships", {}).get("tags", {}).get("data", [])
-                tag_ids = [tag["id"] for tag in flow_tags]
-                tag_names = [tag_map.get(tag_id, "") for tag_id in tag_ids if tag_id in tag_map]
-                
-                stat_data["tag_ids"] = tag_ids
-                stat_data["tag_names"] = tag_names
-                
-                flow_stats_to_upsert.append(stat_data)
-        
-        # Bulk upsert flow stats
-        result = await FlowStats.bulk_upsert_flow_stats(flow_stats_to_upsert)
-        
-        logger.info(f"Flow sync completed for store {store.public_id}: {result}")
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error syncing flows for store {store.public_id}: {str(e)}")
-        raise
-
-
-async def sync_store_stats(store_id: str):
-    """Main sync function for a store"""
+async def sync_store_stats(klaviyo_public_id: str):
+    """Main sync function for a klaviyo account"""
     try:
         # Get store
-        store = await Store.get(store_id)
+        store = await Store.find_one({"klaviyo_integration.public_id": klaviyo_public_id})
         if not store:
-            logger.error(f"Store not found: {store_id}")
+            logger.error(f"Store not found for klaviyo_public_id: {klaviyo_public_id}")
             return
         
         # Check if already updating
-        if store.is_updating_dashboard:
+        if store.klaviyo_integration.is_updating_dashboard:
             logger.info(f"Store {store.public_id} is already updating")
             return
         
         # Check if data is fresh
         if await is_data_fresh(store):
             logger.info(f"Data is fresh for store {store.public_id}, skipping sync")
-            store.is_updating_dashboard = False
+            store.klaviyo_integration.is_updating_dashboard = False
             await store.save()
             return
         
-        # Mark as updating
-        store.is_updating_dashboard = True
-        await store.save()
+        # Run the sync
+        await klaviyo_update_stats(store)
+        logger.info(f"Sync completed for store {store.public_id}")
         
-        try:
-            # Get Klaviyo API key
-            api_key = store.klaviyo_integration.api_key or settings.KLAVIYO_API_KEY
-            if not api_key:
-                raise ValueError("No Klaviyo API key available")
-            
-            async with await create_klaviyo_client(api_key) as client:
-                # Sync campaigns and flows in parallel
-                campaign_task = asyncio.create_task(sync_campaign_stats(store, client))
-                flow_task = asyncio.create_task(sync_flow_stats(store, client))
-                
-                campaign_result, flow_result = await asyncio.gather(
-                    campaign_task, flow_task, return_exceptions=True
-                )
-                
-                if isinstance(campaign_result, Exception):
-                    logger.error(f"Campaign sync failed: {campaign_result}")
-                
-                if isinstance(flow_result, Exception):
-                    logger.error(f"Flow sync failed: {flow_result}")
-                
-                # Update sync timestamp
-                store.last_dashboard_sync = datetime.utcnow()
-                store.is_updating_dashboard = False
-                await store.save()
-                
-                logger.info(f"Sync completed for store {store.public_id}")
-                
-        except Exception as e:
-            logger.error(f"Error during sync for store {store.public_id}: {str(e)}")
-            store.is_updating_dashboard = False
-            await store.save()
-            raise
-            
     except Exception as e:
         logger.error(f"Fatal error in sync_store_stats: {str(e)}")
         raise

@@ -5,10 +5,12 @@ from contextlib import asynccontextmanager
 import logging
 import time
 import uuid
+import asyncio
 
 from .core.config import settings
 from .db.database import connect_to_mongo, close_mongo_connection
 from .api.v1.api import api_router
+from .utils.memory_monitor import MemoryMonitor, estimate_user_capacity
 
 # Configure logging
 logging.basicConfig(
@@ -22,13 +24,39 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up FastAPI Email Server...")
+    
+    # Log initial memory usage
+    MemoryMonitor.log_memory_usage("Startup - Before MongoDB")
+    
     await connect_to_mongo()
     logger.info("Connected to MongoDB")
+    
+    # Log memory after MongoDB connection
+    MemoryMonitor.log_memory_usage("Startup - After MongoDB")
+    
+    # Show capacity estimates
+    capacity = estimate_user_capacity(16384)  # 16GB for Render
+    logger.info(
+        f"📊 Server Capacity Estimates (16GB RAM): "
+        f"Max {capacity['estimated_capacity']['active_users']:,} active users, "
+        f"Max {capacity['recommendations']['max_concurrent_syncs']} concurrent syncs"
+    )
+    
+    # Start periodic memory monitoring
+    monitor_task = asyncio.create_task(
+        MemoryMonitor.start_periodic_monitoring(interval_seconds=300)  # Every 5 minutes
+    )
+    
     yield
+    
     # Shutdown
     logger.info("Shutting down...")
+    monitor_task.cancel()
     await close_mongo_connection()
     logger.info("Disconnected from MongoDB")
+    
+    # Final memory usage
+    MemoryMonitor.log_memory_usage("Shutdown")
 
 
 app = FastAPI(
@@ -83,11 +111,21 @@ async def root():
 # Status endpoint
 @app.get("/status", tags=["health"])
 async def status():
+    memory_info = MemoryMonitor.get_memory_info()
     return {
         "status": "healthy",
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "memory": {
+            "process_mb": round(memory_info["process_rss_mb"], 1),
+            "process_percent": round(memory_info["process_percent"], 1),
+            "system_available_mb": round(memory_info["system_available_mb"], 1),
+            "system_percent": round(memory_info["system_percent"], 1),
+            "cpu_percent": round(memory_info["cpu_percent"], 1),
+            "threads": memory_info["num_threads"],
+            "connections": memory_info["num_connections"]
+        }
     }
 
 

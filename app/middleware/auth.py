@@ -1,6 +1,5 @@
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.security.utils import get_authorization_scheme_param
 from starlette.requests import Request
 from typing import Optional
 from ..core.config import settings
@@ -37,7 +36,7 @@ async def validate_private_key(
         try:
             body = await request.json()
             private_key = body.get("privateKey")
-        except:
+        except Exception:
             pass
     
     if not private_key:

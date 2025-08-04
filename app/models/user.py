@@ -2,7 +2,6 @@ from datetime import datetime
 from typing import List
 from beanie import Document, Link, Indexed
 from pydantic import Field, EmailStr
-from bson import ObjectId
 from .store import Store
 
 

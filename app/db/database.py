@@ -1,6 +1,6 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from beanie import init_beanie
-from ..models import Store, User, CampaignStats, FlowStats
+from ..models import Store, User, CampaignStats, FlowStats, FlowRecentStats
 from ..core.config import settings
 
 client: AsyncIOMotorClient = None
@@ -18,8 +18,10 @@ async def connect_to_mongo():
             Store,
             User,
             CampaignStats,
-            FlowStats
-        ]
+            FlowStats,
+            FlowRecentStats
+        ],
+        allow_index_dropping=False
     )
 
 

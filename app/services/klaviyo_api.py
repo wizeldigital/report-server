@@ -1,12 +1,140 @@
 import httpx
 import asyncio
 import base64
-from typing import Dict, Any, List, Optional, AsyncGenerator, Callable
+from typing import Dict, Any, List, Optional, AsyncGenerator, Callable, Literal
 from datetime import datetime
 import logging
 from ..core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Constants matching Node.js version
+BASE_URL = "https://a.klaviyo.com/api/"
+REVISION = "2025-04-15"
+
+
+def get_klaviyo_headers(api_key: str) -> Dict[str, str]:
+    """Returns the correct headers for Klaviyo API requests."""
+    headers = {
+        "revision": REVISION,
+        "Accept": "application/vnd.api+json",
+        "Content-Type": "application/json",
+    }
+    
+    if api_key and api_key.startswith("pk_"):
+        headers["Authorization"] = f"Klaviyo-API-Key {api_key}"
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    return headers
+
+
+async def klaviyo_request(
+    method: Literal["GET", "POST", "PATCH", "DELETE"],
+    endpoint: str,
+    api_key: str,
+    payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Generic Klaviyo API request function."""
+    url = endpoint if endpoint.startswith("http") else f"{BASE_URL}{endpoint}"
+    headers = get_klaviyo_headers(api_key)
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:  # 60 second timeout for large requests
+        if payload and method in ["POST", "PATCH"]:
+            response = await client.request(method, url, headers=headers, json=payload)
+        else:
+            response = await client.request(method, url, headers=headers)
+        
+        if response.status_code >= 400:
+            error_text = response.text
+            raise Exception(f"Klaviyo API error: {response.status_code} {error_text}")
+        
+        return response.json()
+
+
+# Convenience wrappers
+async def klaviyo_get(endpoint: str, api_key: str) -> Dict[str, Any]:
+    return await klaviyo_request("GET", endpoint, api_key)
+
+
+async def klaviyo_post(endpoint: str, payload: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    return await klaviyo_request("POST", endpoint, api_key, payload)
+
+
+async def klaviyo_patch(endpoint: str, payload: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    return await klaviyo_request("PATCH", endpoint, api_key, payload)
+
+
+async def klaviyo_delete(endpoint: str, api_key: str) -> Dict[str, Any]:
+    return await klaviyo_request("DELETE", endpoint, api_key)
+
+
+async def klaviyo_get_all(endpoint: str, api_key: str) -> Dict[str, Any]:
+    """Fetches all paginated results from a Klaviyo endpoint."""
+    url = endpoint
+    all_data = []
+    all_included = []
+    first_response = None
+    
+    while url:
+        res = await klaviyo_get(url, api_key)
+        if not first_response:
+            first_response = res
+        
+        if isinstance(res.get("data"), list):
+            all_data.extend(res["data"])
+        
+        if isinstance(res.get("included"), list):
+            all_included.extend(res["included"])
+        
+        url = res.get("links", {}).get("next")
+    
+    # Return a combined response
+    return {
+        **first_response,
+        "data": all_data,
+        "included": all_included,
+        "links": first_response.get("links", {})
+    }
+
+
+async def klaviyo_report_post(endpoint: str, payload: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    """Post to report endpoints and handle paginated results."""
+    url = endpoint
+    all_data = []
+    all_included = []
+    all_results = []
+    first_response = None
+    
+    while url:
+        res = await klaviyo_post(url, payload, api_key)
+        if not first_response:
+            first_response = res
+        
+        if isinstance(res.get("data"), list):
+            all_data.extend(res["data"])
+        
+        if isinstance(res.get("included"), list):
+            all_included.extend(res["included"])
+        
+        # Concatenate results arrays if present
+        if (res.get("data") and 
+            res["data"].get("attributes") and 
+            isinstance(res["data"]["attributes"].get("results"), list)):
+            all_results.extend(res["data"]["attributes"]["results"])
+        
+        url = res.get("links", {}).get("next")
+    
+    # Attach the combined results to the returned data
+    if first_response and first_response.get("data") and first_response["data"].get("attributes"):
+        first_response["data"]["attributes"]["results"] = all_results
+    
+    return {
+        **first_response,
+        "data": first_response.get("data"),
+        "included": all_included,
+        "links": first_response.get("links", {})
+    }
 
 
 class KlaviyoAPIClient:
@@ -220,7 +348,7 @@ class KlaviyoAPIClient:
         metric_names: List[str]
     ) -> Dict[str, Any]:
         """Get aggregated metrics for a campaign"""
-        endpoint = f"/reporting/campaign-values-reports"
+        endpoint = "/reporting/campaign-values-reports"
         
         params = {
             "filter": f"equals(campaign_id,'{campaign_id}')",
@@ -254,7 +382,7 @@ class KlaviyoAPIClient:
         end_date: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """Get metrics for a flow message"""
-        endpoint = f"/reporting/flow-series-reports"
+        endpoint = "/reporting/flow-series-reports"
         
         params = {
             "filter": f"equals(flow_id,'{flow_id}'),equals(flow_message_id,'{message_id}')",
@@ -313,7 +441,8 @@ async def create_klaviyo_client(
 async def create_klaviyo_client_from_store(store) -> KlaviyoAPIClient:
     """Create a Klaviyo API client instance from store integration settings"""
     oauth_token = store.klaviyo_integration.oauth_token
-    api_key = store.klaviyo_integration.api_key
+    # Support both apiKey and api_key field names
+    api_key = store.klaviyo_integration.apiKey or store.klaviyo_integration.api_key
     refresh_token = store.klaviyo_integration.refresh_token
     
     credential = oauth_token or api_key
@@ -328,3 +457,59 @@ async def create_klaviyo_client_from_store(store) -> KlaviyoAPIClient:
         logger.info(f"Updated OAuth tokens for store {store.public_id}")
     
     return KlaviyoAPIClient(credential, refresh_token, token_refresh_callback)
+
+
+async def get_flows_with_rate_limit(
+    flow_ids: List[str], 
+    api_key: str,
+    max_concurrent: int = 2,
+    delay_ms: int = 1000
+) -> List[Dict[str, Any]]:
+    """
+    Rate-limited helper function to get multiple flows.
+    Respects Klaviyo's rate limits: 3/s burst, 60/m steady.
+    """
+    results = []
+    errors = []
+    
+    # Process flows in batches to respect rate limits
+    for i in range(0, len(flow_ids), max_concurrent):
+        batch = flow_ids[i:i + max_concurrent]
+        batch_tasks = []
+        
+        for idx, flow_id in enumerate(batch):
+            # Add small delay between requests in the same batch
+            if idx > 0:
+                await asyncio.sleep(0.35)  # ~3/s rate limit
+            
+            batch_tasks.append(get_flow(flow_id, api_key))
+        
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        
+        for flow_id, result in zip(batch, batch_results):
+            if isinstance(result, Exception):
+                logger.error(f"Error fetching flow {flow_id}: {result}")
+                errors.append({"flow_id": flow_id, "error": str(result)})
+            elif result:
+                results.append(result)
+        
+        # Add delay between batches to respect steady rate limit
+        if i + max_concurrent < len(flow_ids):
+            await asyncio.sleep(delay_ms / 1000)
+    
+    if errors:
+        logger.warning(f"Failed to fetch {len(errors)} flows: {errors}")
+    
+    return results
+
+
+async def get_flow(flow_id: str, api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Get a single flow by ID with error handling.
+    """
+    try:
+        response = await klaviyo_get(f"flows/{flow_id}", api_key)
+        return response
+    except Exception as e:
+        logger.error(f"Error fetching flow {flow_id}: {e}")
+        return None

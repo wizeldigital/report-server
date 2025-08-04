@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from bson import ObjectId
-from ....models import FlowStats, Store, User
+from ....models import FlowStats, User
 from ....middleware.auth import validate_private_key
 from ....core.permissions import has_permission, VIEW_ANALYTICS
 
